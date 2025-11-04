@@ -1,0 +1,133 @@
+<div id="content">
+
+<h1>Retrotransposon:Gene Junction Reads Quantification Pipeline</h1>
+<p>This pipeline is designed to assemble transcripts starting from initial RNA-Seq reads. The reads are aligned using a two-pass alignment strategy to increase the sensitivity of identifying spliced reads. StringTie2 is then used to find novel exon structures and assemble the aligned reads into transcripts. Split RNA-seq reads are collected from the second pass alignment files. Exons are overlapped with retrotransposons (RTs), to find the if the edges of an exon are overlapping with an RT. The final step is to match the junctions previously identified with annotated or assembled exons. The final output can be used for further analysis. </p>
+
+<p>The Code for this pipeline can be downloaded here <a href="https://wangftp.wustl.edu/~aanand/TE_Transcript_Assembly_Website/scripts.tar.gz" download=""> here</a> or from the <a href="download.html">Download</a> page</p>
+
+<p>This pipeline was developed by Wanqing Shao</p>
+
+<h1>Steps to Run Pipeline</h1>
+<p>The current pipeline starts from raw fastq files, generates bigwig files, and then assembled transcripts and junction files. The assembled transcripts and junction files can be used for later down stream analysis</p>
+<p>This page provides a general overview of the pipeline, many of the scripts may require slight modifications to run properly (correction for tool path, library installation etc.)</p>
+
+<h2>Step 1: Adapter Trimming and First Pass Alignment</h2>
+<p>The script “first_alignment_pe_truseq.sh“ was used for adapter trimming and the first round of alignment for paired-end samples that use TruSeq adapters (if a different adapter is used, the script may need to be modified accordingly). The script uses a STAR index that is stored in the memory to reduce memory usage when multiple files are processed simultaneously.</p>
+<p>To load STAR index in the memory and run first_alignment_PE_TruSeq.sh for multiple samples, run the following command in the terminal.</p>
+<pre>    STAR --genomeDir /path/to/star/index --genomeLoad LoadAndExit 
+    parallel -uj 10 ./first_alignment_PE_TruSeq.sh {} /path/to/star/index 5 ::: sample1 sample2 sample3 
+</pre>
+
+<p><b>STAR Version:</b> STAR-2.7.0c</p>
+<p><b>Cutadapt Version:</b> 1.9</p>
+
+<h2>Step 2: Select Junctions and Updating STAR Index</h2>
+<p>This step only needs to be run once for each species' reference genome</p>
+<p>For the CDK2AP1 project, we created updated STAR indices for the second pass alignment after the initial alignments where completed (This approach was selected due to computational efficiency). Alternatively, two-pass alignment can also be done with each sample "on the fly", see STAR manual for more details.</p>
+<p>The following commands should be run in the terminal. The first command filters for canonical splicing junctions with at least 3 reads in at least 1 sample. Parameters may be adjusted to achieve the best performance.</p>
+<pre>    cat *SJ.out.tab | awk '{FS="\t";OFS="\t"} {if ($5 &gt; 0 &amp;&amp; $7 &gt; 2 &amp;&amp; $6==0 &amp;&amp; $4==1) print $1, $2, $3, "+"; else if ($5 &gt; 0 &amp;&amp; $7 &gt; 2 &amp;&amp; $6==0 &amp;&amp; $4==2) print $1, $2, $3, "-";}' | sort | uniq &gt;  SJ.filtered.tab   
+</pre>
+    
+<pre>    STAR --runThreadN 10 \
+    --runMode genomeGenerate \
+    --genomeDir /path/to/updated/STAR/index \
+    --genomeFastaFiles /path/to/genome/fasta/file \
+    --sjdbGTFfile /path/to/gene/gtf/file \
+    --sjdbFileChrStartEnd /path/to/filtered/SJfile/SJ.filtered.tab
+</pre>
+<p><b>STAR Version:</b> STAR-2.7.1a</p>
+
+<h2>Step 3: Second Pass Alignment</h2>
+<p>The script "second_alignment_PE.sh" is used for the second pass alignment.</p>
+<p>To load the updated STAR index in into memory and run second_alignment_PE.sh for multiple samples, run the following two commands:</p>
+<pre>    STAR --genomeDir /path/to/updated/STAR/index --genomeLoad LoadAndExit
+    parallel -uj 10 ./second_alignment_PE.sh {} /path/to/updated/STAR/index 5 ::: sample1 sample2 sample3 
+</pre>
+<p><b>STAR Version:</b> STAR-2.7.1a</p>
+
+<h2>Step 4: Indexing BAM Files</h2>
+<p>Index the BAM files using samtools</p>
+<pre>    parallel -uj 10 samtools index {} ::: *_2nd_pass*bam 
+</pre>
+<p><b>Samtools Version:</b> 1.9</p>
+
+<h2>Step 5: Generating Normalized Bigwig Files</h2>
+<p>Normalized bigwig files are generated using bamCoverage from <a href="https://deeptools.readthedocs.io/en/develop/content/tools/bamCoverage.html">deeptools</a>
+</p><p>For the CDK2AP1 project, we used uniquely mapped reads for bigwig generation (--minMappingQuality 255) and normalized the tracks to Count Per Million (CPM) for ease of comparisons between samples.</p>
+<p>To generate normalized bigwig files, run the following commands in the terminal. The resulting .bw files can be viewed in IGV.</p>
+<pre>    parallel -uj 10 bamCoverage --bam {} -o \`basename {} Aligned.sortedByCoord.out.bam\`uniq_reads_cpm.bw -of bigwig --minMappingQuality 255 --normalizeUsing CPM -p 3 ::: *_2nd_pass*bam  
+</pre>
+<p><b>Deeptools Version:</b> 2.2</p>
+
+<h2>Step 6: Transcript Assembly</h2>
+<p>StringTie2 was used for transcript assembly for this pipeline.</p>
+<p>Notes about StringTie2:</p>
+<ol>
+    <li>StringTie2 considers multiply mapped reads (even-distribution)</li>
+    <li>If a sample is stranded, --rf or --fr could be specified to improve the accuracy of strand determination at repetitive regions</li>
+    <li>A guided assembly (with -G gtf) may generates better results.</li>
+    </ol>
+<p>Here, StringTie2 is run for individual samples, the parameter used are:</p>
+    <ol>
+        <li>Require 2 reads for junction assembly</li>
+        <li>5 reads for single exon transcript assembly</li>
+        <li>2 reads for multi-exon transcript assembly</li>
+    </ol>
+<p>Parameters can be tweaked to adjust the sensitivity &amp; specificity. </p>
+
+<p>The StringTie output is then merged using taco. Taco will create a folder called merged_gtf, there will be a gtf file named assembly.gtf, this file contains the assembled transcript and can be viewed in IGV</p>
+
+<p>To generate merged transcripts for each study, run the following commands in the terminal:</p>
+<pre>    parallel -uj 10 stringtie {} -p 2 -j 2 -s 5 -f 0.05 -c 2 -o \`basename {} Aligned.sortedByCoord.out.bam\`_stringtie_output.gtf ::: *_2nd_pass*bam  
+    ls *gtf &gt; gtf_to_merge.txt
+    taco_run -o merged_gtf -p 10 ./gtf_to_merge.txt 
+</pre>
+<p><b>Stringtie Version:</b> 2.1.4</p>
+<p><b>taco Version:</b> v0.7.3</p>
+
+<h2>Step 7: Collecting Splicing Junctions</h2>
+<p>The script "bam2junc_uniq.sh" is used to collect splicing juctions, it calls the followign scripts: "filter_cs.py", "sam_to_bed.py", "bed2junc.pl".</p>
+<p>"filter_cs.py", "sam_to_bed.py", "bed2junc.pl", "bam2junc_uniq.sh" and "merge_junction_files.r" were constructed for collecting splicing junctions detected in RNAseq datasets. Some of the scripts were adapted from <a href="https://www.nature.com/articles/s41588-017-0004-9">leafcutter</a> due to the original leafcutter script not handeling soft-clipping properly.</p>
+
+<p>For CDK2AP1 we used uniquely aligned reads for junction signal quantification (samtools view -q 255, this only works for STAR output). </p>
+<pre>    parallel -uj 10 bam2junc_uniq.sh {} \`basename {} _Aligned.sortedByCoord.out.bam\`_uniq.junc ::: *_2nd_pass*bam 
+    ls *_uniq.junc &gt; junc_file_list.txt 
+</pre>
+
+<p>The script "merge_junction_files.r" is then used to merge junctions. This R script merges the junction files from multiple samples and generates the junction-by-sample matrix (value for each cell is the number of reads across each junction). Junctions that are within 10bp away for both splicing donor site and acceptor site were merged.</p>
+<p>The R librarys: parallel, methods, data.table, magrittr, optparse, reshape and GenomicRanges are required to run this script</p>
+<p>Notes: This script is not that memory efficient for combining a large number of samples. For datasets with more than 100 samples/cells, -p as 1 is recommended.</p>
+<pre>    Rscript merge_junction_files.r -j junc_file_list.txt -p 10 -n all_samples 
+</pre>
+
+<h2>Step 8: Clean Repeatmakser File</h2>
+<p>Subset the repeat masker files from UCSC for future steps, saving the following columns: chr, start, end, strand and repClass. The code example below process the hg38.rmsk.txt file:</p>
+<pre>    echo -e "chr\tstart\tend\tstrand\trepName\trepClass\trepFamily" &gt; hg38.rmsk.cleaned.txt
+    cut -f6-8,10,11,12,13 hg38.rmsk.txt &gt;&gt; hg38.rmsk.cleaned.txt
+</pre>
+
+<h2>Step 9: Overlap Exons with RTs </h2>
+<p>The script name "overlap_exon_with_te.r" process the gene and assembled transcript gtf files, collects the exons, calculates the percentage of RT sequence for each exon, and returns information about if the edges of each exon are overlapping with RT</p>
+<p>At the moment, this script only works for cleaned repeatmasker files with the following columns: chr, start, end, strand and repClass.</p>
+<p>For CDK2ap1, we focused on retrotransposons (LTR, SINE and LINE), but this script can be modified to include DNA elements</p>
+<pre>    Rscript overlap_exon_with_te.r -g hg38.ncbiRefSeq.gtf -t taco_assembly.gtf -p 5 -n hg38 -r hg38.rmsk.cleaned.txt
+</pre>
+
+<h2>Step 10: Identifying RT-Gene Junctions </h2>
+<p>The script "overlap_junction_with_exon.r" matches the junctions with annotated or assembled exons. It generates a table with the following information:</p>
+<ol>
+    <li>info: junction information with chr:start:end format.</li>
+    <li>gene_name: which annotated gene that exon is matched to</li>
+    <li>junction_type: types of junctions including promoter_tss (RT provides the splicing donor site of the first intron, the 5' of the annotated or assembled transcript overlaps with an RT), promoter (RT provides the splicing donor site of the first intron, the 5' of the annotated or assembled transcript does not overlap with an RT), internal (RT provides splicing sites for internal exons), terminator (RT provides splicing acceptor sites for the last intron). If a splicing junction is involved in multiple transcripts and could be classified as different types, all types were listed and separated by "/"</li>
+    <li>max_te_perc: for exons that are adjacent to RT overlapping splicing sites, what percentage of their sequences are derived from TE.</li>
+    <li>start_te_repName, start_te_repFamily, start_te_repClass, start_te_info: The subfamily name, family name, class name and coordinates for RTs that overlap with the 5' of a splicing junction (splicing junctions were all considered as non-stranded). NA is used when the splicing site does not overlap with RT.</li>
+    <li>end_te_repName, end_te_repFamily, end_te_repClass, end_te_info: The subfamily name, family name, class name and coordinates for RTs that overlap with the 3' of a splicing junction (splicing junctions were all considered as non-stranded). NA is used when the splicing site does not overlap with RT.</li>
+</ol>
+<p>R libraries: parallel, methods, data.table, magrittr, optparse, reshape and GenomicRanges are required for this script.</p>
+<pre>    Rscript overlap_junction_with_exon.r -e hg38_exon_collection.txt -j all_samples_junc_combined.txt -r hg38.rmsk.cleaned.txt -p 5 -n all_samples
+</pre>
+
+<p>
+
+</p>
+</div>
