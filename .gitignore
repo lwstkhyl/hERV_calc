@@ -1,2 +1,5 @@
 data
 .idea
+.Rproj.user
+.Rhistory
+.RData

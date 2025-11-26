@@ -1,0 +1,99 @@
+---
+title: "gpt_practice"
+output: html_document
+date: "2025-11-21"
+---
+
+```{r}
+library(Seurat)
+library(SeuratData)
+InstallData("pbmc3k")
+# 或直接下载http://seurat.nygenome.org/src/contrib/pbmc3k.SeuratData_3.1.4.tar.gz，之后本地安装install.packages("C:\\Users\\17185\\Downloads\\pbmc3k.SeuratData_3.1.4.tar.gz", repos = NULL, type = "source")
+InstallData("ifnb")
+# 或直接下载https://seurat.nygenome.org/src/contrib/ifnb.SeuratData_3.1.0.tar.gz，之后本地安装install.packages("C:\\Users\\17185\\Downloads\\Compressed\\ifnb.SeuratData_3.1.0.tar.gz", repos = NULL, type = "source")
+```
+### pbmc3k数据的分析
+#### 载入数据
+```{r}
+library(pbmc3k.SeuratData)
+data("pbmc3k")
+pbmc <- UpdateSeuratObject(object = pbmc3k)
+```
+认识Seurat对象：
+```{r}
+pbmc  # 有多少个细胞和features，以及当前的数据类型（RNA）
+slotNames(pbmc)  # 有哪些slot
+head(pbmc@meta.data)  # nCount_RNA和nFeature_RNA是后面质控要用的两个基础指标
+```
+常用的slot：
+- `@assays`：表达矩阵、归一化结果等
+- `@meta.data`：细胞的各种信息（行为细胞）
+- `@active.ident`：当前的“分组标签”（后来聚类就写在这）
+- `@reductions`：PCA/UMAP等降维结果
+
+#### 质控(QC)
+**加上线粒体比例**：`PercentageFeatureSet`
+- 标记“线粒体基因比例”，用来排除可能是坏掉/应激严重的细胞
+
+```{r}
+pbmc[["percent.mt"]] <- PercentageFeatureSet(
+  pbmc,
+  pattern = "^MT-"   # 人类线粒体基因以 MT- 开头
+)  # 在 meta.data 里新建一列叫 percent.mt
+head(pbmc@meta.data)
+```
+现在meta.data就有三列关键QC指标了：
+- `nFeature_RNA`：这个细胞检测到多少基因
+- `nCount_RNA`：这个细胞一共多少UMI
+- `percent.mt`：线粒体reads占百分之多少
+
+![gpt_practice1](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice1.png){:width="600px" height="600px"}
+
+**看QC图**：`VlnPlot`+`FeatureScatter`
+- 看看这些指标的分布，大致选过滤阈值
+
+```{r}
+# 小提琴图
+VlnPlot(pbmc, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)  
+# 两个散点图
+FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "percent.mt")  
+FeatureScatter(pbmc, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+```
+
+`VlnPlot`：画小提琴图，每个点是一细胞
+- `features`：要画的列名（必须在meta.data或Assay中存在）
+- `group.by`：按什么分组画（还没聚类就默认一组）
+
+![gpt_practice2](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice2.png){:width="600px" height="600px"}
+
+`FeatureScatter`：x/y都是meta.data里的列名
+- 第一张：总UMI - 线粒体比例
+- 第二张：总UMI - 检测基因数
+
+![gpt_practice3](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice3.png){:width="500px" height="500px"}
+
+![gpt_practice4](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice4.png){:width="500px" height="500px"}
+
+- 右下角那种nCount很高但nFeature不升反降的点，往往是doublet/奇怪细胞
+- percent.mt特别高的一群，很可能是坏细胞
+
+**按阈值过滤**：`subset`
+- 把“很可疑”的细胞直接丢掉，减少后面噪音
+
+```{r}
+pbmc <- subset(
+  pbmc,
+  subset = nFeature_RNA > 200 &  # 阈值根据上面画的图确定
+           nFeature_RNA < 2500 &
+           percent.mt < 5
+)
+```
+
+### ifnbpbmc3k数据的分析
+#### 载入数据
+```{r}
+library(ifnb.SeuratData)
+data("ifnb")
+ifnb <- UpdateSeuratObject(object = ifnb)
+```
+
