@@ -89,6 +89,146 @@ pbmc <- subset(
 )
 ```
 
+#### 归一化/高变基因/标准化
+
+有两条路线：
+- 经典路线：`NormalizeData` → `FindVariableFeatures` → `ScaleData`
+- 推荐的新路线：一次性用`SCTransform`
+
+`NormalizeData`：把不同细胞的测序深度拉到同一量级
+- 不同细胞测到的reads/UMI总数不一样，直接比较counts不公平
+
+具体做法：
+- 每个细胞按总UMI做缩放（库大小归一化）
+- 对缩放后的数值取log1p（稳定方差）
+
+```{r}
+pbmc1 <- NormalizeData(
+  pbmc,
+  normalization.method = "LogNormalize",  # log(x/UMI*10^4 + 1)
+  scale.factor = 1e4,  # 把每个细胞的总表达量缩放到10^4左右
+  verbose = FALSE
+)  # pbmc1[["RNA"]]@data里存的就是log归一化后的表达矩阵
+```
+
+`FindVariableFeatures`：找信息量最大的那几千个基因
+- 几万个基因里，真正对区分细胞类型有帮助的只有几千个
+- 先把这些“高变基因(HVG)”选出来，后面PCA/聚类只用它们，减少噪声
+
+```{r}
+pbmc1 <- FindVariableFeatures(
+  pbmc1,
+  selection.method = "vst",  # 官方推荐的默认方法(variance-stabilizing transformation)
+  nfeatures = 2000  # 选多少个HVGs（通常2000–3000）
+)
+# 查看选出来的基因
+top10 <- head(VariableFeatures(pbmc1), 10)  # 返回HVGs的基因名向量（前10个）
+VariableFeaturePlot(pbmc1)  # 横轴=均值，纵轴=标准化后的离散度，红色点是HVG
+LabelPoints(VariableFeaturePlot(pbmc1), points = top10, repel = TRUE)  # 给指定的点加标签
+```
+
+![gpt_practice5](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice5.png){:width="500px" height="500px"}
+
+`ScaleData`：做Z-score标准化和协变量回归（可选）
+- 每个基因做标准化：让不同基因有可比性
+- （可选）对某些技术/生物因素做回归，比如线粒体比例、细胞周期
+
+```{r}
+pbmc1 <- ScaleData(
+  pbmc1,
+  features = VariableFeatures(pbmc1),  # 要scale的基因集合，通常只对HVG做就够了
+  vars.to.regress = c("percent.mt", "nCount_RNA"),  # 做一个简单线性回归，把这些变量对表达的线性影响减掉
+  verbose = FALSE
+)  # pbmc1[["RNA"]]@scale.data存的就是这个Z-score矩阵（行为基因，列为细胞）
+```
+
+---
+
+`SCTransform`：用一个负二项GLM模型，同时完成归一化+方差稳定+回归协变量，比上面三步更严谨。官方建议优先使用 `SCTransform`，尤其是样本多、噪音复杂时
+
+```{r}
+pbmc2 <- SCTransform(
+  pbmc,
+  vars.to.regress = "percent.mt",
+  verbose = FALSE
+)
+```
+
+注：`vars.to.regress`参数的设置
+- 本质上是把指定的变量（比如`nCount_RNA`、`percent.mt`）对该基因表达的线性影响减掉，这些变量是我们不想要的协变量，希望它没有线性影响
+- `nCount_RNA`是每个细胞的总UMI数，反映：技术因素（测序深度、捕获效率），也可能反映一些生物因素（细胞大小、活跃程度），在第一种方法中，因为已经做了`NormalizeData`，理论上已经按总counts做过一次“库大小归一化”了。如果在实践中，残余的深度效应仍然明显（比如UMAP上按nCount_RNA上色会出现梯度），就可以在`ScaleData`里回归nCount_RNA
+
+  `SCTransform`内部已经用负二项GLM建模了测序深度等因素，一般不需要（也不建议）再额外回归nCount_RNA/nFeature_RNA。可以在SCTransform里只回归一些你确实不希望作为主信号的生物/技术变量，比如percent.mt或细胞周期得分
+- `percent.mt`是线粒体reads占比。即使已经在QC阶段过滤掉特别极端的高mt细胞，剩下细胞里仍可能存在mt稍微偏高的那拨，在PCA里变成前几个PC。因此为了避免让线粒体比例主导聚类结果，通常会指定这个
+
+#### PCA
+
+`RunPCA`：把几千个HVG的维度压缩成几十个主成分
+```{r}
+pbmc3 <- RunPCA(
+  pbmc2,
+  features = VariableFeatures(pbmc2),  # 用于PCA的基因，一般就是HVG
+  npcs = 50,  # 要算多少个PC（常用50）
+  verbose = FALSE
+)
+```
+PCA结果存在`pbmc@reductions$pca`里，包含：
+- `@cell.embeddings`：每个细胞在PC1、PC2...上的坐标
+- `@feature.loadings`：每个基因在各PC上的载荷（贡献度）
+
+看PCA结果：`VizDimLoadings`、`DimPlot`、`DimHeatmap`、`ElbowPlot`
+
+```{r}
+VizDimLoadings(pbmc3, dims = 1:2, reduction = "pca")
+DimPlot(pbmc3, reduction = "pca")
+DimHeatmap(pbmc3, dims = 1:10, cells = 500, balanced = TRUE)
+ElbowPlot(pbmc3, ndims = 50)
+```
+- `VizDimLoadings`：看PC上贡献最大的基因（帮助理解每个PC在分什么）
+  ![gpt_practice6](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice6.png){:width="800px" height="800px"}
+- `DimPlot(..., reduction = "pca")`：画PC1-PC2的散点图
+  ![gpt_practice7](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice7.png){:width="800px" height="800px"}
+- `DimHeatmap`：看某几个PC对哪些细胞/基因区分度大
+  ![gpt_practice8](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice8.png){:width="800px" height="800px"}
+- `ElbowPlot`：选多少个PC用于后面的聚类
+  ![gpt_practice9](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice9.png){:width="800px" height="800px"}
+  - 横轴PC序号，纵轴每个PC的变异解释度
+  - 找“肘部(elbow)”的位置（即曲线的弯曲部位），一般10-20左右，看具体图而定
+
+#### 构图 & 聚类
+
+`FindNeighbors`：构建KNN图
+- 在PCA空间里找每个细胞的K个近邻，形成一个图，后面的聚类就在这个图上做
+
+```{r}
+pbmc4 <- FindNeighbors(
+  pbmc3,
+  dims = 1:10,   # 使用哪些PC（根据上面ElbowPlot）
+  k.param = 20   # 每个点找多少邻居，默认20，过小会太稀疏，过大会挤在一起
+)
+```
+图结构存到`pbmc@graphs`，一般至少有两个：
+- `RNA_snn`：shared nearest neighbor graph
+- `RNA_nn`：最近邻图
+
+`FindClusters`：在图上进行Louvain/Leiden，用图算法把细胞分成几个cluster
+
+```{r}
+pbmc4 <- FindClusters(
+  pbmc4,
+  resolution = 0.5,
+  algorithm = 1 # 默认1 = Louvain，4 = Leiden
+)
+```
+- `resolution`：控制cluster数量的关键参数，越大则cluster越多（细分更细）。常用0.4-0.8
+- `algorithm`：也可以试试Leiden，通常更稳定
+
+聚类结果写入：`pbmc@meta.data$seurat_clusters`、`pbmc@active.ident`
+
+#### 非线性降维与可视化
+
+
+
 ### ifnbpbmc3k数据的分析
 #### 载入数据
 ```{r}
