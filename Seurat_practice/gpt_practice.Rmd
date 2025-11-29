@@ -7,6 +7,7 @@ date: "2025-11-21"
 ```{r}
 library(Seurat)
 library(SeuratData)
+library(tidyverse)
 InstallData("pbmc3k")
 # 或直接下载http://seurat.nygenome.org/src/contrib/pbmc3k.SeuratData_3.1.4.tar.gz，之后本地安装install.packages("C:\\Users\\17185\\Downloads\\pbmc3k.SeuratData_3.1.4.tar.gz", repos = NULL, type = "source")
 InstallData("ifnb")
@@ -227,13 +228,341 @@ pbmc4 <- FindClusters(
 
 #### 非线性降维与可视化
 
+`RunUMAP`或`RunTSNE`：把（10–50维的）PC空间压到2维，方便可视化，同时尽量把“相似的细胞堆在一起”
+- 现在更常用UMAP
 
+```{r}
+pbmc4 <- RunUMAP(
+  pbmc4,
+  dims = 1:10  # 和FindNeighbors一致
+)
+```
 
-### ifnbpbmc3k数据的分析
+`DimPlot`：展示聚类结果
+
+```{r}
+DimPlot(
+  pbmc4, 
+  reduction = "umap",  # 用哪个降维结果("umap"/"tsne"/"pca")
+  label = TRUE  # 在图上直接写cluster号，方便阅读
+)
+```
+
+![gpt_practice10](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice10.png){:width="600px" height="600px"}
+
+#### 找marker基因 & 细胞类型注释
+
+`FindAllMarkers`：每个cluster对其他所有细胞
+- 对每个cluster与其他细胞做差异表达，找“在本cluster高表达、在别处低”的标志基因
+
+```{r}
+pbmc4.markers <- FindAllMarkers(
+  pbmc4,
+  only.pos = TRUE,  # 只保留高表达的marker（不关心在本cluster低表达的基因）
+  min.pct = 0.25,  # 这个基因在某cluster里至少要在25%的细胞中表达
+  logfc.threshold = 0.25,  # logFC至少0.25
+  test.use = "wilcox"  # Wilcoxon秩和检验（scRNA里很常用的非参数方法）
+)
+head(pbmc4.markers)
+pbmc4.markers %>%  # 每个cluster的前几个marker
+  dplyr::group_by(cluster) %>%
+  dplyr::top_n(n = 5, wt = avg_log2FC)
+```
+
+![gpt_practice11](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice11.png){:width="800px" height="800px"}
+- `gene`：基因名
+- `cluster`：这是哪个cluster的marker
+- `avg_log2FC`：差异倍数
+- `pct.1`：在本cluster中表达细胞比例
+- `pct.2`：在其他细胞中表达比例
+- `p_val_adj`：多重校正后的p值
+
+**常见可视化**：VlnPlot/FeaturePlot/DotPlot/DoHeatmap
+
+如果我怀疑cluster 0是T细胞，又知道T细胞有一些标志基因(CD3D/CD3E)
+
+```{r}
+FeaturePlot(pbmc4, features = c("CD3D", "CD3E"))
+VlnPlot(pbmc4, features = c("CD3D"))
+DotPlot(pbmc4, features = c("CD3D", "MS4A1", "LYZ", "GNLY")) + RotatedAxis()
+```
+- `FeaturePlot`：在UMAP上画“这个基因在哪些细胞高表达”
+  ![gpt_practice12](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice12.png){:width="800px" height="800px"}
+- `VlnPlot`：按cluster看表达分布
+  ![gpt_practice13](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice13.png){:width="800px" height="800px"}
+- `DotPlot`：同时看多基因-多cluster：
+  ![gpt_practice14](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice14.png){:width="800px" height="800px"}
+  - 点的大小 = 表达细胞比例
+  - 颜色深浅 = 平均表达量
+
+做一个热图，看每个cluster的top markers
+
+```{r}
+top10 <- pbmc4.markers %>%
+  group_by(cluster) %>%
+  top_n(n = 10, wt = avg_log2FC)
+DoHeatmap(pbmc4, features = top10$gene) + NoLegend()
+```
+
+![gpt_practice15](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice15.png){:width="800px" height="800px"}
+
+**手动注释细胞类型**：给cluster命名
+```{r}
+new.cluster.ids <- c(
+  "Naive CD4 T", "Memory CD4 T", "CD14+ Mono", 
+  "B cell", "CD8 T", "NK", "DC", "Megakaryocytes",
+  "cell 9", "cell 10"
+)
+names(new.cluster.ids) <- levels(pbmc4)
+pbmc4 <- RenameIdents(pbmc4, new.cluster.ids)  # 重命名
+DimPlot(pbmc4, reduction = "umap", label = TRUE)
+```
+
+![gpt_practice16](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice16.png){:width="600px" height="600px"}
+
+### ifnb数据的分析
+
 #### 载入数据
+
 ```{r}
 library(ifnb.SeuratData)
 data("ifnb")
 ifnb <- UpdateSeuratObject(object = ifnb)
+unique(ifnb@meta.data$stim)
 ```
 
+可以看到有两个样本——CTRL/STIM
+- CTRL：未刺激样本
+- STIM：IFN-β刺激样本
+
+#### 按样本拆分对象 & 各自做基础预处理
+
+先把Stim和CTRL拆开，各自做Normalize/HVG/Scale/PCA。后面再把它们整合到同一个低维空间，去掉batch/条件带来的技术差异
+
+```{r}
+ifnb.list <- SplitObject(ifnb, split.by = "stim")
+# 预处理
+for (i in 1:length(ifnb.list)) {
+  ifnb.list[[i]] <- NormalizeData(ifnb.list[[i]])
+  ifnb.list[[i]] <- FindVariableFeatures(ifnb.list[[i]], selection.method = "vst", nfeatures = 2000)
+  ifnb.list[[i]] <- ScaleData(ifnb.list[[i]])
+  ifnb.list[[i]] <- RunPCA(ifnb.list[[i]], features = VariableFeatures(ifnb.list[[i]]))
+}
+```
+- **为什么没做质控**：这套数据已经做过过滤了。如果是一般数据，也是先拆开再分别质控
+- **为什么要先拆开再预处理**：
+  - HVG要在各自样本内部选：如果混在一起选，容易被样本间差异/文库大小差异主导。例如某个基因如果只在STIM里表达，就会被认为是高变，但实际上是测序差异而不是细胞类型差异
+  
+  在每个样本中单独找HVG，后面再找“在至少两个样本中都变异较大”的基因，这样更合理
+  - 各自PCA，避免一个大样本完全主导方向：如果把把所有细胞拼一起PCA，大样本会压制小样本的结构，主成分很容易全是大样本内部的变化。分开后能平衡各样本的贡献
+
+#### 使用锚点做数据整合
+
+**找整合锚点(anchors)**：`FindIntegrationAnchors`
+- 在两个数据集里找到“相互对应”的细胞对，把这些细胞当成“桥”，来学习两者之间的转换关系
+
+**为什么要有这步**：我希望看到“同一种细胞类型在两个样本中能对齐到一起”，而且在UMAP上不会因为批次/技术导致“同一细胞类型被分到两个完全不同的块”
+- 在不整合的情况下，同一细胞类型可能会被分到两堆，一堆全是CTRL，一堆全是STIM
+- 整合后，两堆混成了一堆，可以在里面直接比较Stim-Ctrl的表达变化
+
+换句话说，需要找到一个对应关系——哪个STIM细胞，看起来就是某个CTRL细胞在另一个batch/条件下的版本
+
+```{r}
+# 选一批在两边都重要的基因用来对齐（默认3000个）
+features <- SelectIntegrationFeatures(object.list = ifnb.list, nfeatures = 3000)
+# 找锚点（锚定最近邻+校正）
+ifnb.anchors <- FindIntegrationAnchors(
+  object.list = ifnb.list,
+  anchor.features = features,
+  reduction = "rpca"  # 推荐，速度快，对大数据也友好
+)
+```
+
+anchors：可以把它想成“跨样本的互相最近邻”。先在每个样本内部做PCA，得到两个样本各自的PC空间；再把两个样本的PCA空间对齐坐标系(`reduction = "rpca"`)，即先对所有样本做一次“参考PCA”，再把各自的 PC 表达重新投到这个共享坐标系；在共享低维空间里，寻找互相最近的细胞对（对于每个CTRL细胞，在STIM中找K个最近邻），那些“你是我的最近邻，我也是你的最近邻”的细胞对，就是候选anchor；对候选anchors打分过滤（看它们的局部环境是否也相似）
+- 最终，每个anchor大致包含“来自样本A的某个细胞i，来自样本B的某个细胞j”，以及一些权重/分数（标明可信度）
+- 简单的说，一个anchor就是“认为这两个细胞本质上是同一个细胞类型/类似状态，只是技术和条件不同”
+
+**整合数据**：`IntegrateData`
+- 整合后的表达存到一个新的assay——`integrated`
+- 后面用于PCA/UMAP/聚类的都是这个integrated assay
+
+```{r}
+ifnb.integrated <- IntegrateData(anchorset = ifnb.anchors)
+DefaultAssay(ifnb.integrated) <- "integrated"
+ifnb.integrated
+```
+
+利用这些anchor来学习一个“从B样本映射到A样本”的校正函数，然后把所有B细胞都往这个方向拉，让两边的相同细胞类型对齐
+
+**在整合后的空间里做PCA/UMAP/聚类**（同前）
+
+```{r}
+ifnb.integrated <- ScaleData(ifnb.integrated, verbose = FALSE)
+ifnb.integrated <- RunPCA(ifnb.integrated, npcs = 30, verbose = FALSE)
+ifnb.integrated <- RunUMAP(ifnb.integrated, reduction = "pca", dims = 1:30)
+ifnb.integrated <- FindNeighbors(ifnb.integrated, reduction = "pca", dims = 1:30)
+ifnb.integrated <- FindClusters(ifnb.integrated, resolution = 0.4)
+```
+
+两个最重要的图：
+
+```{r}
+# 看cluster分布
+DimPlot(ifnb.integrated, reduction = "umap", label = TRUE)
+# 看Stim/CTRL在同一UMAP上的混合程度
+DimPlot(ifnb.integrated, reduction = "umap", group.by = "stim")
+```
+
+理想情况下：
+- cluster分布：每个cluster形状比较清晰
+  ![gpt_practice17](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice17.png){:width="600px" height="600px"}
+- 混合程度：大多数cluster里Stim和CTRL都有，而不是“某个cluster全是Stim，另一个全是CTRL”。这说明整合把batch/条件的技术差异对齐了，而保留了真正的细胞类型结构
+  ![gpt_practice18](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice18.png){:width="600px" height="600px"}
+  
+#### 在整合后空间里做细胞类型注释
+
+找marker & 按cluster注释（同前）
+```{r}
+DefaultAssay(ifnb.integrated) <- "RNA"   # 找marker建议用原始RNA，而不是integrated
+ifnb.markers <- FindAllMarkers(
+  ifnb.integrated,
+  only.pos = TRUE,
+  min.pct = 0.25,
+  logfc.threshold = 0.25
+)
+# 每个cluster取前5个marker
+top5 <- ifnb.markers %>%
+  group_by(cluster) %>%
+  top_n(5, wt = avg_log2FC)
+top5
+# 以免疫相关标志基因为例
+FeaturePlot(ifnb.integrated, features = c("MS4A1", "CD79A"))  # B cells
+FeaturePlot(ifnb.integrated, features = c("CD3D", "CD4", "CCR7"))  # CD4 T
+FeaturePlot(ifnb.integrated, features = c("NKG7", "GNLY"))  # NK / CD8 cytotoxic
+FeaturePlot(ifnb.integrated, features = c("LYZ"))  # Monocytes
+# 给 cluster 起名字
+new.cluster.ids <- c(
+  "Naive CD4 T", "Memory CD4 T", "CD14+ Mono", "B cell",
+  "CD8 T", "NK", "DC", "Megakaryocytes", rep("other", 7)
+)
+# RenameIdents（很重要），如果不写后面分组时会报错
+names(new.cluster.ids) <- levels(ifnb.integrated)
+ifnb.integrated <- RenameIdents(ifnb.integrated, new.cluster.ids)
+DimPlot(ifnb.integrated, reduction = "umap", label = TRUE)
+```
+
+![gpt_practice19](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice19.png){:width="600px" height="600px"}
+
+#### 在同一细胞类型中比较Stim-CTRL的差异表达
+
+ifnb数据的核心问题是：同一种细胞类型在IFN-β刺激前后，哪些基因/通路被激活
+
+**Seurat内置 + 细胞级DE**
+
+先只看"Naive CD4 T"这个细胞类型
+
+```{r}
+# 选出Naive CD4 T的细胞
+naive.cd4 <- subset(ifnb.integrated, idents = "Naive CD4 T")
+# 把stim列当作分组变量
+Idents(naive.cd4) <- naive.cd4$stim
+# CTRL vs STIM
+naive.cd4.DE <- FindMarkers(
+  naive.cd4,
+  ident.1 = "STIM",
+  ident.2 = "CTRL",
+  logfc.threshold = 0.25,
+  min.pct = 0.1
+)
+View(naive.cd4.DE)
+View(naive.cd4.DE %>%  # 刺激后上调最明显的基因
+  arrange(desc(avg_log2FC)) %>%
+  head(20))
+```
+
+![gpt_practice20](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice20.png){:width="400px" height="400px"}
+
+---
+
+**pseudobulk**：按照病人/样本ID，先把同一种细胞类型的表达加总成pseudobulk再用edgeR/DESeq2
+- 对每个（样本 × 细胞类型）组合，把细胞counts加总
+- 得到一个pseudo-bulk矩阵：基因为行，“样本 × 细胞类型”为列
+- 用edgeR/DESeq2做DE
+
+---
+
+一个小问题——既然要比较Stim-CTRL，为什么还要anchor+Integrate，而不是直接拿“原始数据”比？
+- 注意anchor+Integrate是为了了解不同样本间的技术偏移，消除批次效应
+- 在真正做差异表达时，我们实际上是先在integrated空间里聚类 & 注释，得到“Naive CD4 T”这一个群，再把这个群的细胞按Stim/Ctrl分两个组，比较同一细胞类型内两个样本的表达差别，这时使用的是原始表达(RNA assay)，不使用integrated里的表达值
+  - 因为它已经被校正了，可能存在“整合时把'某个基因在Stim整体表达偏高'当成批次效应来校正”
+  - 同时`FindMarkers`（无论使用 Wilcoxon/t-test/MAST哪种方法）都隐含假设：输入的是某种“真实的表达测量”——log-normalized counts或近似（对应RNA assay中的`@counts`-原始UMI count或`@data`-log-normalized处理），复杂校正后的值的p值和logFC就不那么严谨了
+- 如果两个样本的批次效应很小，其实可以也不整合，但通常批次效应都很强，不整合的话容易让cluster按照样本来源而不是细胞类型在UMAP上分块
+
+#### 看细胞组成变化：Stim-CTRL中各细胞类型比例
+
+这也是整合的好处之一：可以在同一空间里看Stim前后细胞类型的比例变化
+
+**用prop.table快速看比例**：
+
+```{r}
+tab <- table(ifnb.integrated$stim, Idents(ifnb.integrated))  # 取出meta.data里的stim和cell type
+prop.table(tab, margin = 1)  # 按行（每个条件）归一化
+```
+
+![gpt_practice21](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice21.png){:width="400px" height="400px"}
+
+**用ggplot做一个简单的堆叠条形图**：
+
+```{r}
+# 注意是不是严格的统计检验，只是直观可视化
+df.comp <- as.data.frame(tab)
+colnames(df.comp) <- c("stim", "celltype", "count")
+ggplot(df.comp, aes(x = stim, y = count, fill = celltype)) +
+  geom_bar(stat = "identity", position = "fill") +
+  ylab("Proportion") +
+  theme_classic()
+```
+
+![gpt_practice22](https://lwstkhyl.github.io/upload/md-image/other/gpt_practice22.png){:width="600px" height="600px"}
+
+---
+
+总结：
+- 对每个样本独立做QC/预处理/PCA
+- 用anchors+IntegrateData在一个共同空间里对齐细胞类型，做聚类和可视化
+- 一旦celltype/cluster定好了，就回到RNA assay（或原始counts）上
+- 如果要做更严谨的DE（尤其多病人、多样本），进一步用pseudobulk+edgeR/DESeq2在样本层面建模
+
+#### 使用SCTransform整合工作流
+
+是Seurat官方推荐的方法，`SCTransform`对技术噪声建模更合理，整合效果通常比`LogNormalize`稳定
+
+```{r}
+# 1. 拆分对象
+ifnb.list <- SplitObject(ifnb, split.by = "stim")
+# 2. 每个对象分别SCTransform
+for (i in 1:length(ifnb.list)) {
+  ifnb.list[[i]] <- SCTransform(ifnb.list[[i]], verbose = FALSE)
+}
+# 3. 选整合特征 + 准备整合
+features <- SelectIntegrationFeatures(ifnb.list, nfeatures = 3000)
+ifnb.list <- PrepSCTIntegration(object.list = ifnb.list, anchor.features = features)
+# 4. 找anchors & 整合
+ifnb.anchors <- FindIntegrationAnchors(
+  object.list = ifnb.list,
+  normalization.method = "SCT",
+  anchor.features = features
+)
+ifnb.integrated.sct <- IntegrateData(
+  anchorset = ifnb.anchors,
+  normalization.method = "SCT"
+)
+# 5. 后面PCA/UMAP/聚类/DE的流程基本相同（此处省略部分）
+ifnb.integrated.sct <- ScaleData(ifnb.integrated.sct, verbose = FALSE)
+ifnb.integrated.sct <- RunPCA(ifnb.integrated.sct, npcs = 30, verbose = FALSE)
+ifnb.integrated.sct <- RunUMAP(ifnb.integrated.sct, reduction = "pca", dims = 1:30)
+ifnb.integrated.sct <- FindNeighbors(ifnb.integrated.sct, reduction = "pca", dims = 1:30)
+ifnb.integrated.sct <- FindClusters(ifnb.integrated.sct, resolution = 0.4)
+DimPlot(ifnb.integrated.sct, reduction = "umap", label = TRUE)
+DimPlot(ifnb.integrated.sct, reduction = "umap", group.by = "stim")
+```
