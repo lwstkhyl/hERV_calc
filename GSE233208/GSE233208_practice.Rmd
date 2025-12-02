@@ -1,0 +1,236 @@
+---
+title: "GSE233208_practice"
+output: html_document
+date: "2025-11-30"
+---
+
+```{r}
+library(Seurat)
+library(tidyverse)
+library(ggpubr)
+# BiocManager::install("MAST")
+library(MAST)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+sn <- readRDS("C:\\Users\\17185\\Desktop\\hERV_calc\\GSE233208\\data\\GSE233208_human_snRNA_subset.rds")
+DefaultAssay(sn)  # "RNA"
+colnames(sn@meta.data)
+table(sn$Diagnosis)
+table(sn$cell_type)
+table(sn$SampleID)
+```
+预处理
+```{r}
+sn <- NormalizeData(sn)
+sn <- FindVariableFeatures(sn)
+sn <- ScaleData(sn)
+sn <- RunPCA(sn)
+sn <- FindNeighbors(sn, dims = 1:30)
+sn <- FindClusters(sn, resolution = 0.4)
+sn <- RunUMAP(sn, dims = 1:30)
+```
+初步可视化：看细胞类型和疾病在 UMAP 上的分布
+```{r}
+# 按聚类看
+DimPlot(sn, reduction = "umap", label = TRUE)
+# 按细胞类型看
+DimPlot(sn, reduction = "umap", group.by = "cell_type", label = TRUE)
+# 按有无AD看（Control/DSAD）
+DimPlot(sn, reduction = "umap", group.by = "Diagnosis")
+```
+比较 Control vs DSAD 的细胞组成
+```{r}
+# 统计每个样本里各细胞类型的比例
+cell_comp <- sn@meta.data %>%
+  group_by(SampleID, Diagnosis, cell_type) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(SampleID) %>%
+  mutate(freq = n / sum(n))
+head(cell_comp)
+# 堆叠条形图：每个样本的细胞类型组成
+ggplot(cell_comp, aes(x = SampleID, y = freq, fill = cell_type)) +
+  geom_bar(stat = "identity") +
+  facet_wrap(~ Diagnosis, scales = "free_x") +
+  ylab("细胞类型占比") +
+  xlab("") +
+  theme_bw() +
+  theme(axis.text.x = element_blank(), axis.ticks=element_blank())
+# 箱型图：每个细胞都画一张图，标识在两个样本中的占比
+ggplot(cell_comp, aes(x = Diagnosis, y = freq, fill = Diagnosis)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.1, size = 0.5) +
+  facet_wrap(~ cell_type, scales = "free_y") +
+  theme_bw() + 
+  stat_compare_means(
+    method = "wilcox.test",
+    label = "p.signif"
+  )
+```
+在某个 cell type 内做 DSAD vs Control 的差异表达
+```{r}
+Idents(sn) <- "cell_type"  # 按细胞类型设定身份
+mg <- subset(sn, idents = "MG")  # 取出MG细胞
+Idents(mg) <- mg$Diagnosis  # mg中Diagnosis作分组变量
+mg_DE <- FindMarkers(
+  mg,
+  ident.1 = "DSAD",
+  ident.2 = "Control",  # DSAD相对Control的变化
+  test.use  = "MAST",  # 使用MAST模型
+  logfc.threshold = 0.25,
+  min.pct = 0.1,
+  latent.vars = c("nCount_RNA", "Batch", "PMI", "Sex")  # 协变量
+)
+mg_DE_top <- mg_DE %>% 
+  dplyr::filter(abs(avg_log2FC)>0.5)
+  arrange(p_val_adj) %>%
+  head(20)
+```
+
+```{r}
+mg_DE_up  <- mg_DE %>%  # 取显著上调的基因
+  dplyr::filter(p_val_adj < 0.001, avg_log2FC > 0.5) %>%
+  arrange(desc(avg_log2FC))
+# 小提琴图：看某些基因在MG中DSAD vs Control的差异
+VlnPlot(mg, features = rownames(mg_DE_up)[1:6], group.by = "Diagnosis", pt.size = 0)
+# 在UMAP上（整个数据中）看这些基因表达在哪些细胞类型强
+FeaturePlot(sn, features = rownames(mg_DE_up)[1:4])
+```
+做一下 GO / KEGG 富集
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+# 因为原来的阈值筛出来的基因太少，做GO富集结果很奇怪，这里就放宽了阈值
+mg_DE2 <- FindMarkers(
+  mg,
+  ident.1 = "DSAD",
+  ident.2 = "Control",
+  test.use  = "MAST",
+  logfc.threshold = 0.1,
+  min.pct = 0.1,
+  latent.vars = c("nCount_RNA", "Batch", "PMI", "Sex")
+)
+# 不按p值筛选，直接取前100个
+mg_DE_up <- mg_DE2 %>%
+  dplyr::filter(avg_log2FC > 0) %>%
+  arrange(desc(p_val_adj))
+mg_DE_up_gene <- as.character(rownames(mg_DE_up))[1:100]
+ego <- enrichGO(
+  gene = mg_DE_up_gene,
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  minGSSize = 5
+)
+dotplot(ego, showCategory = 20) + 
+  theme_bw()
+```
+在 cell type 内做亚群（cell states）+ 差异丰度
+```{r}
+DefaultAssay(mg) <- "RNA"
+mg <- NormalizeData(mg)
+mg <- FindVariableFeatures(mg)
+mg <- ScaleData(mg)
+mg <- RunPCA(mg)
+mg <- FindNeighbors(mg, dims = 1:20)
+mg <- FindClusters(mg, resolution = 0.3)
+mg <- RunUMAP(mg, dims = 1:20)
+mg$MG_state <- Idents(mg)
+```
+
+```{r}
+mg_state_markers <- FindAllMarkers(
+  mg,
+  only.pos = TRUE,
+  logfc.threshold = 0.1,
+  min.pct = 0.1
+)
+# 将每个聚类的标志基因写入一个df中
+mg_marker_gene_df <- data.frame()
+for(i in unique(mg_state_markers$cluster)){
+  marker_df <- mg_state_markers %>%
+  dplyr::filter(cluster == i, p_val_adj < 0.05, avg_log2FC > 1) %>%
+  dplyr::arrange(p_val_adj)
+  marker_gene <- paste(rownames(marker_df), collapse = ';')
+  mg_marker_gene_df <- rbind(mg_marker_gene_df, c(i, marker_gene))
+}
+colnames(mg_marker_gene_df) <- c("cluster", "marker_gene")
+write.csv(mg_marker_gene_df, 'mg_marker_gene.csv', col.names = T, row.names = F)
+```
+
+```{r}
+Idents(mg) <- "MG_state"
+mg_pure <- subset(mg, idents = c("0", "2"))
+new.state.ids <- c("MG_DAM", "MG_homeo")  # 激活/SPP1⁺ DAM-like MG --- 稳态P2RY12⁺ MG
+names(new.state.ids) <- levels(mg_pure)
+mg_pure <- RenameIdents(mg_pure, new.state.ids)
+mg_pure$MG_state2 <- Idents(mg_pure)
+# 按Diagnosis着色
+DimPlot(mg_pure, reduction = "umap", group.by = "Diagnosis")
+# 按MG_state着色
+DimPlot(mg_pure, reduction = "umap", group.by = "MG_state2", label = TRUE)
+# Diagnosis + MG_state交叉
+DimPlot(mg_pure, reduction = "umap", split.by = "Diagnosis", group.by = "MG_state2")
+```
+看每个 MG_state 在 Control vs DSAD 中的丰度差异
+```{r}
+mg_state_comp <- mg_pure@meta.data %>%
+  group_by(SampleID, Diagnosis, MG_state2) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(SampleID) %>%
+  mutate(freq = n / sum(n))
+ggplot(mg_state_comp, aes(x = Diagnosis, y = freq, fill = Diagnosis)) +
+  geom_boxplot(outlier.shape = NA, alpha = 0.6) +
+  geom_jitter(width = 0.1, size = 0.5, alpha = 0.6) +
+  facet_wrap(~ MG_state2, scales = "free_y") +
+  ylab("Proportion within microglia") +
+  theme_bw() + 
+  stat_compare_means(
+    method = "wilcox.test",
+    label = "p.signif"
+  )
+```
+分析某个“显著 state”里面发生了什么
+```{r}
+Idents(mg_pure) <- "MG_state2"
+mg_dam <- subset(mg_pure, idents = "MG_DAM")
+Idents(mg_dam) <- mg_dam$Diagnosis
+mg_dam_DE <- FindMarkers(
+  mg_dam,
+  ident.1 = "DSAD",
+  ident.2 = "Control",
+  test.use = "MAST",
+  logfc.threshold = 0.1,
+  min.pct = 0.1,
+  latent.vars = c("nCount_RNA", "Batch", "PMI", "Sex")
+)
+# 由于差异基因很少，就不做后续分析了
+```
+
+```{r}
+mg_state_DE <- FindMarkers(
+  mg_pure,
+  ident.1 = "MG_DAM",
+  ident.2 = "MG_homeo",
+  test.use = "MAST",
+  logfc.threshold = 0.1,
+  min.pct = 0.1
+)
+mg_state_DE_up <- mg_state_DE %>%
+  dplyr::filter(avg_log2FC > 0, p_val_adj < 0.1) %>%
+  arrange(desc(p_val_adj))
+ego <- enrichGO(
+  gene = rownames(mg_state_DE_up),
+  OrgDb = org.Hs.eg.db,
+  keyType = "SYMBOL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.2,
+  minGSSize = 5
+)
+dotplot(ego, showCategory = 20) + 
+  theme_bw()
+```
